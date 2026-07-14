@@ -33,7 +33,14 @@ use crate::{
 };
 
 /// Default TTL for partial messages kept.
-pub(crate) const DEFAULT_PARTIAL_TTL: usize = 5;
+///
+/// blobsim patch: upstream keeps partial state for 5 heartbeats (~3.5s at
+/// 700ms), which is shorter than the proposal->column-seeding gap (t=0 ->
+/// t=4s) in a 12s Ethereum slot, so every peer's view of advertised
+/// available/requests bitmaps expires before the builder seeds and each
+/// recovery round stalls ~3.5s behind the stale-metadata publish check.
+/// Raised so partial state outlives a slot (30 x 700ms = 21s).
+pub(crate) const DEFAULT_PARTIAL_TTL: usize = 30;
 
 /// PartialMessage is a message that can be broken up into parts.
 /// This trait allows applications to define custom strategies for splitting large messages
@@ -499,21 +506,16 @@ impl State {
         let cached = topic_partials.partial_messages.entry(group_id.clone());
         if let Entry::Occupied(cached) = &cached {
             let mut old_metadata = cached.get().content.metadata();
-            if !old_metadata
+            // blobsim patch: upstream early-returns here when the republished
+            // metadata is unchanged ("stale data"), which silently drops
+            // re-advertisements to peers whose per-peer state (our metadata as
+            // they know it) has expired or was never delivered. The per-peer
+            // dedup in `publish_action` already suppresses sends to peers whose
+            // view is current, so proceeding is loop-free; validate the update
+            // for errors but publish regardless.
+            let _ = old_metadata
                 .update(metadata.as_slice())
-                .map_err(PublishError::Partial)?
-            {
-                tracing::debug!(
-                    ?metadata,
-                    ?old_metadata,
-                    ?group_id,
-                    ?topic_hash,
-                    "Partial was not updated due to stale data; skipping publish"
-                );
-                // Metadata was not updated, so we do not need to send anything and keep the
-                // previously sent message in cache.
-                return Ok(vec![]);
-            }
+                .map_err(PublishError::Partial)?;
         }
 
         // Cache the sent partial before publishing, so the local node retains what it
