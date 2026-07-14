@@ -871,11 +871,16 @@ where
     }
 
     #[cfg(feature = "partial-messages")]
+    /// Publish a partial message, returning the total number of payload bytes
+    /// (partial body + metadata) actually queued to peers across all recipient
+    /// RPCs. Callers use this to account outbound partial-message bandwidth
+    /// symmetrically with the inbound side (which sees `body + metadata` per
+    /// `Event::Partial`); the behaviour otherwise exposes no outbound partial event.
     pub fn publish_partial<P: Partial + 'static>(
         &mut self,
         topic: impl Into<TopicHash>,
         partial_message: P,
-    ) -> Result<(), PublishError> {
+    ) -> Result<usize, PublishError> {
         let topic_hash = topic.into();
         let candidates = self
             .publish_peers(&topic_hash)
@@ -908,9 +913,20 @@ where
             recipients,
         )?;
 
+        let mut bytes_sent = 0usize;
         for action in publish_actions {
             match action {
                 PublishAction::SendMessage { peer_id, rpc } => {
+                    #[cfg(feature = "partial-messages")]
+                    if let RpcOut::PartialMessage(crate::partial_messages::PartialMessage {
+                        body,
+                        metadata,
+                        ..
+                    }) = &rpc
+                    {
+                        bytes_sent += body.as_ref().map(|b| b.len()).unwrap_or_default()
+                            + metadata.as_ref().map(|m| m.len()).unwrap_or_default();
+                    }
                     self.send_message(peer_id, rpc);
                 }
                 PublishAction::PenalizePeer {
@@ -923,7 +939,7 @@ where
                 }
             }
         }
-        Ok(())
+        Ok(bytes_sent)
     }
 
     /// This function should be called when [`Config::validate_messages()`] is `true` after
