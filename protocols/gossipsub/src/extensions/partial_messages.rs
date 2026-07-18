@@ -42,6 +42,19 @@ use crate::{
 /// Raised so partial state outlives a slot (30 x 700ms = 21s).
 pub(crate) const DEFAULT_PARTIAL_TTL: usize = 30;
 
+/// Cumulative partial-message traffic observed by the gossipsub behaviour.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PartialTrafficStats {
+    /// Body and metadata bytes accepted into peer send queues.
+    pub tx_bytes: u64,
+    /// Partial-message RPCs accepted into peer send queues.
+    pub tx_msgs: u64,
+    /// Body and metadata bytes received from peers.
+    pub rx_bytes: u64,
+    /// Partial-message RPCs received from peers.
+    pub rx_msgs: u64,
+}
+
 /// PartialMessage is a message that can be broken up into parts.
 /// This trait allows applications to define custom strategies for splitting large messages
 /// into parts and reconstructing them from received partial data. It provides the core
@@ -693,6 +706,12 @@ pub struct PartialMessage {
     pub body: Option<Vec<u8>>,
     /// The partial metadata we have and want.
     pub metadata: Option<Vec<u8>>,
+}
+
+impl PartialMessage {
+    pub(crate) fn payload_len(&self) -> usize {
+        self.body.as_ref().map_or(0, Vec::len) + self.metadata.as_ref().map_or(0, Vec::len)
+    }
 }
 
 impl Debug for PartialMessage {

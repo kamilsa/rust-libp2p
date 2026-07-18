@@ -1572,6 +1572,129 @@ fn test_heartbeat_max_metadata_length() {
     );
 }
 
+/// Verifies that a redundant received body is counted as raw traffic even though it does not
+/// produce an application event.
+#[test]
+fn test_partial_traffic_counts_redundant_received_body() {
+    let group_id: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
+    let (mut gs, peers, mut queues, topics) = DefaultBehaviourTestBuilder::default()
+        .peer_no(1)
+        .topics(vec!["test-partial".into()])
+        .to_subscribe(true)
+        .peer_kind(PeerKind::Gossipsubv1_3)
+        .requests_partial(true)
+        .supports_partial(true)
+        .create_network();
+    let peer = peers[0];
+    let topic_hash = topics[0].clone();
+
+    let mut local_message = Bitmap::new(group_id);
+    local_message.fill_parts(0b01010101);
+    gs.publish_partial(topic_hash, local_message)
+        .expect("Publish should succeed");
+
+    let mut receiver_queue = queues.remove(&peer).unwrap();
+    let redundant_partial = loop {
+        match receiver_queue.try_pop() {
+            Some(RpcOut::PartialMessage(partial_message)) => break partial_message,
+            Some(_) => {}
+            None => panic!("Should have sent PartialMessage"),
+        }
+    };
+    let expected_rx_bytes = redundant_partial.payload_len() as u64;
+
+    gs.events.clear();
+    let before = gs.partial_traffic();
+    gs.on_connection_handler_event(
+        peer,
+        ConnectionId::new_unchecked(0),
+        HandlerEvent::Message {
+            rpc: RpcIn {
+                messages: vec![],
+                subscriptions: vec![],
+                control_msgs: vec![],
+                partial_message: Some(redundant_partial),
+            },
+            invalid_messages: vec![],
+        },
+    );
+
+    assert!(
+        !gs.events
+            .iter()
+            .any(|event| matches!(event, ToSwarm::GenerateEvent(Event::Partial { .. }))),
+        "Redundant partial body should not emit Event::Partial"
+    );
+    let after = gs.partial_traffic();
+    assert_eq!(after.rx_msgs, before.rx_msgs + 1);
+    assert_eq!(after.rx_bytes, before.rx_bytes + expected_rx_bytes);
+    assert_eq!(after.tx_msgs, before.tx_msgs);
+    assert_eq!(after.tx_bytes, before.tx_bytes);
+}
+
+/// Verifies that outbound traffic counts only partial RPCs accepted into the peer queue.
+#[test]
+fn test_partial_traffic_excludes_queue_full_send() {
+    let config = ConfigBuilder::default()
+        .connection_handler_queue_len(1)
+        .build()
+        .unwrap();
+    let (mut gs, peers, mut queues, topics) = DefaultBehaviourTestBuilder::default()
+        .peer_no(1)
+        .topics(vec!["test-partial".into()])
+        .to_subscribe(true)
+        .peer_kind(PeerKind::Gossipsubv1_3)
+        .requests_partial(true)
+        .supports_partial(true)
+        .gs_config(config)
+        .create_network();
+    let peer = peers[0];
+    let topic_hash = topics[0].clone();
+    let mut receiver_queue = queues.remove(&peer).unwrap();
+
+    assert!(gs.send_message(peer, RpcOut::TestExtension));
+
+    let mut dropped_message = Bitmap::new([1, 2, 3, 4, 5, 6, 7, 8]);
+    dropped_message.fill_parts(0b01010101);
+    let dropped_bytes = gs
+        .publish_partial(topic_hash.clone(), dropped_message)
+        .expect("Publish should still succeed when the queue is full");
+    assert_eq!(dropped_bytes, 0);
+    assert_eq!(gs.partial_traffic().tx_msgs, 0);
+    assert_eq!(gs.partial_traffic().tx_bytes, 0);
+
+    let mut saw_test_extension = false;
+    let mut saw_partial = false;
+    while let Some(rpc) = receiver_queue.try_pop() {
+        match rpc {
+            RpcOut::TestExtension => saw_test_extension = true,
+            RpcOut::PartialMessage(_) => saw_partial = true,
+            _ => {}
+        }
+    }
+    assert!(saw_test_extension);
+    assert!(!saw_partial, "Queue-full partial should not be queued");
+
+    let mut queued_message = Bitmap::new([8, 7, 6, 5, 4, 3, 2, 1]);
+    queued_message.fill_parts(0b10101010);
+    let queued_bytes = gs
+        .publish_partial(topic_hash, queued_message)
+        .expect("Publish should succeed after draining the queue");
+    assert!(queued_bytes > 0);
+
+    let stats = gs.partial_traffic();
+    assert_eq!(stats.tx_msgs, 1);
+    assert_eq!(stats.tx_bytes, queued_bytes as u64);
+    let queued_partial = loop {
+        match receiver_queue.try_pop() {
+            Some(RpcOut::PartialMessage(partial_message)) => break partial_message,
+            Some(_) => {}
+            None => panic!("Should have queued PartialMessage"),
+        }
+    };
+    assert_eq!(queued_partial.payload_len(), queued_bytes);
+}
+
 /// Verifies that:
 /// - Two nodes exchange partial messages via the Behaviour API.
 /// - Node1 publishes even parts (0b01010101) and receives odd parts from Node2.

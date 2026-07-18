@@ -79,7 +79,9 @@ use crate::{
 };
 #[cfg(feature = "partial-messages")]
 use crate::{
-    extensions::partial_messages::{self, Partial, PublishAction, ReceivedAction},
+    extensions::partial_messages::{
+        self, Partial, PartialTrafficStats, PublishAction, ReceivedAction,
+    },
     types::SubscriptionOpts,
 };
 
@@ -325,6 +327,10 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     #[cfg(feature = "partial-messages")]
     partial_messages_extension: partial_messages::State,
 
+    /// Cumulative partial-message traffic counters.
+    #[cfg(feature = "partial-messages")]
+    partial_traffic: PartialTrafficStats,
+
     /// Map of topics to list of peers that we publish to, but don't subscribe to.
     fanout: HashMap<TopicHash, BTreeSet<PeerId>>,
 
@@ -490,6 +496,8 @@ where
             gossip_promises: Default::default(),
             #[cfg(feature = "partial-messages")]
             partial_messages_extension: Default::default(),
+            #[cfg(feature = "partial-messages")]
+            partial_traffic: Default::default(),
         })
     }
 
@@ -862,6 +870,18 @@ where
     }
 
     #[cfg(feature = "partial-messages")]
+    /// Returns cumulative partial-message traffic observed at the RPC layer.
+    ///
+    /// Unlike [`Event::Partial`], which is emitted only for partial data needed by the
+    /// application, these counters include every received partial-message RPC, including
+    /// redundant or otherwise filtered messages. Transmitted messages are counted only after
+    /// they are accepted into a peer's send queue. Byte counters include the partial body and
+    /// metadata only. Callers can diff successive snapshots to measure traffic over an interval.
+    pub fn partial_traffic(&self) -> PartialTrafficStats {
+        self.partial_traffic
+    }
+
+    #[cfg(feature = "partial-messages")]
     /// Report an invalid partial message from a peer, originating at the application layer.
     /// This triggers penalties for the peer that sent the invalid partial.
     pub fn report_invalid_partial(&mut self, peer_id: PeerId, topic_hash: &TopicHash) {
@@ -872,10 +892,7 @@ where
 
     #[cfg(feature = "partial-messages")]
     /// Publish a partial message, returning the total number of payload bytes
-    /// (partial body + metadata) actually queued to peers across all recipient
-    /// RPCs. Callers use this to account outbound partial-message bandwidth
-    /// symmetrically with the inbound side (which sees `body + metadata` per
-    /// `Event::Partial`); the behaviour otherwise exposes no outbound partial event.
+    /// (partial body + metadata) accepted into peer send queues across all recipient RPCs.
     pub fn publish_partial<P: Partial + 'static>(
         &mut self,
         topic: impl Into<TopicHash>,
@@ -917,17 +934,13 @@ where
         for action in publish_actions {
             match action {
                 PublishAction::SendMessage { peer_id, rpc } => {
-                    #[cfg(feature = "partial-messages")]
-                    if let RpcOut::PartialMessage(crate::partial_messages::PartialMessage {
-                        body,
-                        metadata,
-                        ..
-                    }) = &rpc
-                    {
-                        bytes_sent += body.as_ref().map(|b| b.len()).unwrap_or_default()
-                            + metadata.as_ref().map(|m| m.len()).unwrap_or_default();
+                    let payload_len = match &rpc {
+                        RpcOut::PartialMessage(partial_message) => partial_message.payload_len(),
+                        _ => 0,
+                    };
+                    if self.send_message(peer_id, rpc) {
+                        bytes_sent += payload_len;
                     }
-                    self.send_message(peer_id, rpc);
                 }
                 PublishAction::PenalizePeer {
                     peer_id,
@@ -3147,6 +3160,12 @@ where
     /// sending the message failed due to the channel to the connection handler being
     /// full (which indicates a slow peer).
     fn send_message(&mut self, peer_id: PeerId, rpc: RpcOut) -> bool {
+        #[cfg(feature = "partial-messages")]
+        let partial_payload_len = match &rpc {
+            RpcOut::PartialMessage(partial_message) => Some(partial_message.payload_len()),
+            _ => None,
+        };
+
         #[cfg(feature = "metrics")]
         if let Some(m) = self.metrics.as_mut() {
             // register bytes sent on the internal metrics.
@@ -3184,7 +3203,17 @@ where
         // High priority messages should not fail.
         tracing::debug!(%peer_id, ?rpc, "Sending Rpc");
         match peer.messages.try_push(rpc) {
-            Ok(()) => true,
+            Ok(()) => {
+                #[cfg(feature = "partial-messages")]
+                if let Some(payload_len) = partial_payload_len {
+                    self.partial_traffic.tx_msgs = self.partial_traffic.tx_msgs.saturating_add(1);
+                    self.partial_traffic.tx_bytes = self
+                        .partial_traffic
+                        .tx_bytes
+                        .saturating_add(payload_len as u64);
+                }
+                true
+            }
             Err(rpc) => {
                 // Sending failed because the channel is full.
                 tracing::warn!(%peer_id, ?rpc, "Send Queue full. Could not send Rpc.");
@@ -3564,6 +3593,19 @@ where
                 // Handle the gossipsub RPC
                 tracing::debug!(rpc = ?rpc, "Received RPC");
 
+                #[cfg(feature = "partial-messages")]
+                let mut rpc = rpc;
+                #[cfg(feature = "partial-messages")]
+                let partial_message = rpc.partial_message.take();
+                #[cfg(feature = "partial-messages")]
+                if let Some(partial_message) = partial_message.as_ref() {
+                    self.partial_traffic.rx_msgs = self.partial_traffic.rx_msgs.saturating_add(1);
+                    self.partial_traffic.rx_bytes = self
+                        .partial_traffic
+                        .rx_bytes
+                        .saturating_add(partial_message.payload_len() as u64);
+                }
+
                 // Handle subscriptions
                 // Update connected peers topics
                 if !rpc.subscriptions.is_empty() {
@@ -3673,7 +3715,7 @@ where
                 }
 
                 #[cfg(feature = "partial-messages")]
-                if let Some(partial_message) = rpc.partial_message {
+                if let Some(partial_message) = partial_message {
                     if self
                         .peer_score
                         .below_threshold(&propagation_source, |ts| ts.graylist_threshold)
