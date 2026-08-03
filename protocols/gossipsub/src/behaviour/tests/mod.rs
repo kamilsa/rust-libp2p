@@ -43,6 +43,7 @@ mod publish;
 mod scoring;
 mod subscription;
 mod topic_config;
+mod traffic;
 
 use std::collections::HashMap;
 

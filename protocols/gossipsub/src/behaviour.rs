@@ -70,6 +70,7 @@ use crate::{
     subscription_filter::{AllowAllSubscriptionFilter, TopicSubscriptionFilter},
     time_cache::DuplicateCache,
     topic::{Hasher, Topic, TopicHash},
+    traffic::{self, Attribution, GossipTrafficStats},
     transform::{DataTransform, IdentityTransform},
     types::{
         ControlAction, Extensions, Graft, IDontWant, IHave, IWant, Message, MessageAcceptance,
@@ -331,6 +332,10 @@ pub struct Behaviour<D = IdentityTransform, F = AllowAllSubscriptionFilter> {
     #[cfg(feature = "partial-messages")]
     partial_traffic: PartialTrafficStats,
 
+    /// Cumulative per-topic traffic counters, split by direction and by
+    /// data/control class.
+    traffic: GossipTrafficStats,
+
     /// Map of topics to list of peers that we publish to, but don't subscribe to.
     fanout: HashMap<TopicHash, BTreeSet<PeerId>>,
 
@@ -498,6 +503,7 @@ where
             partial_messages_extension: Default::default(),
             #[cfg(feature = "partial-messages")]
             partial_traffic: Default::default(),
+            traffic: Default::default(),
         })
     }
 
@@ -720,11 +726,12 @@ where
             if raw_message.raw_protobuf_len() > self.config.idontwant_message_size_threshold()
                 && self.config.idontwant_on_publish()
             {
-                self.send_message(
+                self.send_message_for_topic(
                     *peer_id,
                     RpcOut::IDontWant(IDontWant {
                         message_ids: vec![msg_id.clone()],
                     }),
+                    &raw_message.topic,
                 );
             }
 
@@ -879,6 +886,21 @@ where
     /// metadata only. Callers can diff successive snapshots to measure traffic over an interval.
     pub fn partial_traffic(&self) -> PartialTrafficStats {
         self.partial_traffic
+    }
+
+    /// Returns cumulative per-topic traffic counters, split by direction and by
+    /// data/control class.
+    ///
+    /// This accounts for every byte gossipsub exchanges — including the control
+    /// messages that never surface as an [`Event`] — so callers can attribute
+    /// bandwidth to a topic and tell payload apart from protocol overhead. See
+    /// the [`crate::traffic`] module docs for the measurement semantics; in
+    /// particular, outbound is counted at *enqueue* time and so describes
+    /// offered load rather than wire occupancy.
+    ///
+    /// Counters are cumulative; diff successive snapshots to measure a rate.
+    pub fn traffic(&self) -> &GossipTrafficStats {
+        &self.traffic
     }
 
     #[cfg(feature = "partial-messages")]
@@ -1394,6 +1416,10 @@ where
         tracing::trace!(peer=%peer_id, "Handling IHAVE for peer");
 
         let mut iwant_ids = HashSet::new();
+        // A single IWANT batches ids drawn from every topic in this IHAVE, and
+        // the wire format does not name their topic. Remember where each id came
+        // from so the outbound control bytes can still be attributed per topic.
+        let mut iwant_id_topics = HashMap::new();
 
         for (topic, ids) in ihave_msgs {
             // only process the message if we are subscribed
@@ -1427,7 +1453,8 @@ where
                 !self.gossip_promises.contains(id)
             }) {
                 // have not seen this message and are not currently requesting it
-                if iwant_ids.insert(id) {
+                if iwant_ids.insert(id.clone()) {
+                    iwant_id_topics.insert(id, topic.clone());
                     // Register the IWANT metric
                     #[cfg(feature = "metrics")]
                     if let Some(metrics) = self.metrics.as_mut() {
@@ -1477,11 +1504,12 @@ where
                 iwant_ids_vec
             );
 
-            self.send_message(
+            self.send_message_attributed(
                 *peer_id,
                 RpcOut::IWant(IWant {
                     message_ids: iwant_ids_vec,
                 }),
+                Attribution::PerMessage(&iwant_id_topics),
             );
         }
         tracing::trace!(peer=%peer_id, "Completed IHAVE handling for peer");
@@ -1998,11 +2026,12 @@ where
                 .collect::<HashSet<PeerId>>();
 
             for peer_id in recipient_peers {
-                self.send_message(
+                self.send_message_for_topic(
                     peer_id,
                     RpcOut::IDontWant(IDontWant {
                         message_ids: vec![msg_id.clone()],
                     }),
+                    &message.topic,
                 );
             }
         }
@@ -3160,6 +3189,25 @@ where
     /// sending the message failed due to the channel to the connection handler being
     /// full (which indicates a slow peer).
     fn send_message(&mut self, peer_id: PeerId, rpc: RpcOut) -> bool {
+        self.send_message_attributed(peer_id, rpc, Attribution::None)
+    }
+
+    /// [`Self::send_message`], naming the topic an otherwise topic-less RPC
+    /// belongs to.
+    ///
+    /// IWANT and IDONTWANT identify messages by id only, so the wire format
+    /// carries no topic. The call sites always know it, and pass it here so
+    /// [`Self::traffic`] can attribute the control bytes correctly.
+    fn send_message_for_topic(&mut self, peer_id: PeerId, rpc: RpcOut, topic: &TopicHash) -> bool {
+        self.send_message_attributed(peer_id, rpc, Attribution::Topic(topic))
+    }
+
+    fn send_message_attributed(
+        &mut self,
+        peer_id: PeerId,
+        rpc: RpcOut,
+        attribution: Attribution<'_>,
+    ) -> bool {
         #[cfg(feature = "partial-messages")]
         let partial_payload_len = match &rpc {
             RpcOut::PartialMessage(partial_message) => Some(partial_message.payload_len()),
@@ -3188,6 +3236,10 @@ where
             }
         }
 
+        // Measure before the queue takes ownership; only committed below, once
+        // the queue has actually accepted the RPC.
+        let contribution = traffic::classify_outbound(&rpc, attribution);
+
         let Some(peer) = &mut self.connected_peers.get_mut(&peer_id) else {
             tracing::error!(peer = %peer_id,
                     "Could not send rpc to connection handler, peer doesn't exist in connected peer list");
@@ -3204,6 +3256,7 @@ where
         tracing::debug!(%peer_id, ?rpc, "Sending Rpc");
         match peer.messages.try_push(rpc) {
             Ok(()) => {
+                contribution.apply_tx(&mut self.traffic);
                 #[cfg(feature = "partial-messages")]
                 if let Some(payload_len) = partial_payload_len {
                     self.partial_traffic.tx_msgs = self.partial_traffic.tx_msgs.saturating_add(1);
@@ -3573,9 +3626,11 @@ where
                     }
                 }
             }
-            // rpc is only used for metrics code.
-            #[allow(unused_variables)]
             HandlerEvent::MessageDropped(rpc) => {
+                // The bytes were booked when the RPC was enqueued, but it timed
+                // out in the queue and never reached the wire — take them back.
+                traffic::account_outbound_dropped(&mut self.traffic, &rpc);
+
                 // Account for this in the scoring logic
                 if let PeerScoreState::Active(peer_score) = &mut self.peer_score {
                     peer_score.failed_message_slow_peer(&propagation_source);
@@ -3604,6 +3659,31 @@ where
                         .partial_traffic
                         .rx_bytes
                         .saturating_add(partial_message.payload_len() as u64);
+                }
+
+                // Book the received bytes per topic. Done up front, before the
+                // graylist and validation checks below can bail out: these bytes
+                // arrived over the wire and cost us downlink either way.
+                {
+                    // Disjoint field borrows: the resolver reads the message
+                    // cache while the counters are mutated.
+                    let mcache = &self.mcache;
+                    let stats = &mut self.traffic;
+                    for message in &rpc.messages {
+                        traffic::account_inbound_message(stats, message);
+                    }
+                    for subscription in &rpc.subscriptions {
+                        traffic::account_inbound_subscription(stats, subscription);
+                    }
+                    for control in &rpc.control_msgs {
+                        traffic::account_inbound_control(stats, control, |id| {
+                            mcache.get(id).map(|message| message.topic.clone())
+                        });
+                    }
+                    #[cfg(feature = "partial-messages")]
+                    if let Some(partial_message) = partial_message.as_ref() {
+                        traffic::account_inbound_partial(stats, partial_message);
+                    }
                 }
 
                 // Handle subscriptions

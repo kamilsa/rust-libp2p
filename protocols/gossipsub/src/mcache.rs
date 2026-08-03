@@ -111,8 +111,10 @@ impl MessageCache {
         }
     }
 
-    /// Get a message with `message_id`
-    #[cfg(test)]
+    /// Get a message with `message_id`.
+    ///
+    /// Unlike [`Self::get_with_iwant_counts`] this is a pure read, which is what
+    /// traffic accounting needs to map a message id back to its topic.
     pub(crate) fn get(&self, message_id: &MessageId) -> Option<&RawMessage> {
         self.msgs.get(message_id).map(|(message, _)| message)
     }
