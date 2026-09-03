@@ -761,6 +761,45 @@ where
         Ok(msg_id)
     }
 
+    /// Ask this topic's mesh peers not to forward the supplied messages back
+    /// to us.
+    ///
+    /// Returns the number of peers whose send queue accepted the control
+    /// message. Peers that do not support Gossipsub v1.2 are skipped.
+    pub fn send_idontwant_to_mesh(
+        &mut self,
+        topic: impl Into<TopicHash>,
+        message_ids: impl IntoIterator<Item = MessageId>,
+    ) -> usize {
+        let topic = topic.into();
+        let message_ids: Vec<_> = message_ids.into_iter().collect();
+        if message_ids.is_empty() {
+            return 0;
+        }
+
+        let peers: Vec<_> = self
+            .mesh
+            .get(&topic)
+            .into_iter()
+            .flatten()
+            .copied()
+            .collect();
+
+        let mut sent = 0;
+        for peer_id in peers {
+            if self.send_message_for_topic(
+                peer_id,
+                RpcOut::IDontWant(IDontWant {
+                    message_ids: message_ids.clone(),
+                }),
+                &topic,
+            ) {
+                sent += 1;
+            }
+        }
+        sent
+    }
+
     /// Get all peers on the topic that have a sufficiently high score to allow publishing.
     fn publish_peers<'a>(&'a self, topic_hash: &'a TopicHash) -> impl Iterator<Item = PeerId> + 'a {
         self.connected_peers

@@ -132,6 +132,58 @@ fn doesnt_send_idontwant() {
     assert_eq!(idontwants, 0, "Should have sent 0 IDONWANT messages");
 }
 
+#[test]
+fn sends_explicit_idontwant_to_mesh() {
+    let (mut gs, _peers, queues, topic_hashes) = DefaultBehaviourTestBuilder::default()
+        .peer_no(4)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(Config::default())
+        .explicit(1)
+        .peer_kind(PeerKind::Gossipsubv1_2)
+        .create_network();
+    let message_id = MessageId::new(&[0, 1, 2, 3]);
+
+    assert_eq!(
+        gs.send_idontwant_to_mesh(topic_hashes[0].clone(), [message_id.clone()]),
+        3
+    );
+    let sent = queues
+        .into_values()
+        .flat_map(|mut queue| std::iter::from_fn(move || queue.try_pop()))
+        .filter(|rpc| {
+            matches!(
+                rpc,
+                RpcOut::IDontWant(IDontWant { message_ids }) if message_ids == &vec![message_id.clone()]
+            )
+        })
+        .count();
+    assert_eq!(sent, 3);
+}
+
+#[test]
+fn explicit_idontwant_skips_unsupported_mesh_peers() {
+    let (mut gs, _peers, queues, topic_hashes) = DefaultBehaviourTestBuilder::default()
+        .peer_no(4)
+        .topics(vec![String::from("topic1")])
+        .to_subscribe(true)
+        .gs_config(Config::default())
+        .explicit(1)
+        .peer_kind(PeerKind::Gossipsubv1_1)
+        .create_network();
+
+    assert_eq!(
+        gs.send_idontwant_to_mesh(topic_hashes[0].clone(), [MessageId::new(&[0, 1, 2, 3])]),
+        0
+    );
+    let sent = queues
+        .into_values()
+        .flat_map(|mut queue| std::iter::from_fn(move || queue.try_pop()))
+        .filter(|rpc| matches!(rpc, RpcOut::IDontWant(_)))
+        .count();
+    assert_eq!(sent, 0);
+}
+
 /// Test that a node doesn't forward a messages to the mesh peers
 /// that sent IDONTWANT.
 #[test]
